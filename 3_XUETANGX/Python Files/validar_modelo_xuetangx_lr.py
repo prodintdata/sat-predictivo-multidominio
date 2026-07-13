@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, roc_auc_score, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
@@ -25,6 +25,7 @@ def ejecutar_prediccion_lr():
     
     engine = create_engine(f"mysql+pymysql://{usuario}:{contrasena}@{servidor}:{puerto}/{base_datos}")
     dir_graficos = os.path.join(dir_raiz, "Graficos")
+    os.makedirs(dir_graficos, exist_ok=True)
 
     # 2. EXTRAER DATOS DE XUETANGX TRAIN
     print("\n[LR] Extrayendo datos de XuetangX TRAIN desde MySQL...")
@@ -107,13 +108,17 @@ def ejecutar_prediccion_lr():
     df_eval_final['prediccion_sat'] = modelo_lr.predict(X_test)
     df_eval_final['score_riesgo'] = modelo_lr.predict_proba(X_test)[:, 1]
 
-    # 7. REPORTE
+    # 7. REPORTE Y CONSOLIDACIÓN ANALÍTICA
     acc = accuracy_score(y_real, df_eval_final['prediccion_sat'])
     prec = precision_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
     rec = recall_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
     f1 = f1_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
     auc_value = roc_auc_score(y_real, df_eval_final['score_riesgo'])
     cm = confusion_matrix(y_real, df_eval_final['prediccion_sat'])
+    tn, fp, fn, tp = cm.ravel()
+    
+    mse_val = mean_squared_error(y_real, df_eval_final['score_riesgo'])
+    r2_val = r2_score(y_real, df_eval_final['score_riesgo'])
 
     print("\n" + "="*80)
     print("REPORTE DE RENDIMIENTO - REGRESIÓN LOGÍSTICA NATIVA")
@@ -121,16 +126,35 @@ def ejecutar_prediccion_lr():
     print(f"Accuracy: {acc*100:.2f}% | Precision: {prec*100:.2f}% | Recall: {rec*100:.2f}% | F1: {f1*100:.2f}% | AUC: {auc_value:.4f}")
     print("="*80)
     
+    # Lógica de guardado sin sobreescritura destructiva
+    ruta_csv_metricas = os.path.join(dir_raiz, "CSV Files", "metricas_generales_xuetangx.csv")
+    os.makedirs(os.path.dirname(ruta_csv_metricas), exist_ok=True)
+    
+    nueva_fila = pd.DataFrame([{
+        'Algoritmo': 'Regresión Logística', 'Verdaderos_Negativos_TN': tn, 'Falsos_Positivos_FP': fp,
+        'Falsos_Negativos_FN': fn, 'Verdaderos_Positivos_TP': tp, 'Precision_Manual': prec,
+        'Recall_Manual': rec, 'F1_Score_Manual_Basal': f1, 'precision_macro': prec, 'recall_macro': rec,
+        'f1_macro': f1, 'accuracy': acc, 'roc_auc': auc_value, 'mse': mse_val, 'r2_score': r2_val
+    }])
+    
+    if os.path.exists(ruta_csv_metricas):
+        df_existente = pd.read_csv(ruta_csv_metricas)
+        df_existente = df_existente[df_existente['Algoritmo'] != 'Regresión Logística']
+        df_consolidado = pd.concat([df_existente, nueva_fila], ignore_index=True)
+    else:
+        df_consolidado = nueva_fila
+        
+    df_consolidado.to_csv(ruta_csv_metricas, index=False)
+    print(f"[OK] Métricas de Regresión Logística consolidadas en: {ruta_csv_metricas}")
+
     # 8. EXPORTACIÓN A TABLA EXCLUSIVA
     tabla_lr = 'tablon_predicciones_test_xuetangx_lr'
-    print(f"\nExportando a MySQL tabla: '{tabla_lr}'...")
+    print(f"Exportando a MySQL tabla: '{tabla_lr}'...")
     df_eval_final.to_sql(name=tabla_lr, con=engine, if_exists='replace', index=False)
 
     # 9. GENERACIÓN DE GRÁFICOS AISLADOS
     timestamp = datetime.now().strftime("%Y%m%dd_%H%M%S")
     
-    # Gráfico 1: Matriz de Confusión Corregida
-    print("Generando Matriz de Confusión...")
     plt.clf()
     fig1 = plt.figure(figsize=(7, 5), dpi=300)
     sns.set_theme(style="white")
@@ -143,8 +167,6 @@ def ejecutar_prediccion_lr():
     plt.savefig(os.path.join(dir_graficos, f"matriz_confusion_lr_{timestamp}.png"), dpi=300, bbox_inches='tight')
     plt.close(fig1)
 
-    # Gráfico 2: Curva ROC Individual
-    print("Generando Curva AUC ROC...")
     plt.clf()
     fig2 = plt.figure(figsize=(7, 6), dpi=300)
     sns.set_theme(style="whitegrid")
