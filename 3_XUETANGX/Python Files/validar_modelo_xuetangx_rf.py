@@ -1,0 +1,166 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+def ejecutar_prediccion_rf():
+    # 1. ENTORNO Y RUTAS
+    ruta_script = os.path.dirname(os.path.abspath(__file__))
+    dir_raiz = os.path.dirname(ruta_script)
+    
+    load_dotenv(dotenv_path=os.path.join(dir_raiz, ".env"))
+
+    usuario = os.getenv("DB_USER")
+    contrasena = os.getenv("DB_PASSWORD")
+    servidor = os.getenv("DB_HOST")
+    puerto = os.getenv("DB_PORT")
+    base_datos = os.getenv("DB_NAME")
+    
+    engine = create_engine(f"mysql+pymysql://{usuario}:{contrasena}@{servidor}:{puerto}/{base_datos}")
+    dir_graficos = os.path.join(dir_raiz, "Graficos")
+
+    # 2. EXTRAER DATOS DE XUETANGX TRAIN PARA ENTRENAMIENTO NATIVO
+    print("\n[RF] Extrayendo datos de XuetangX TRAIN desde MySQL...")
+    query_train = "SELECT * FROM tablon_validacion_xuetangx"
+    df_train_xuetangx = pd.read_sql(query_train, con=engine)
+    
+    features_cols = ['beta_0_intercepto', 'beta_1_pendiente', 'densidad_conexion', 'coef_variacion', 'max_racha_inactividad']
+    df_train_clean = df_train_xuetangx.dropna(subset=features_cols + ['dropped_out']).copy()
+    
+    X_train = df_train_clean[features_cols]
+    y_train = df_train_clean['dropped_out'].values
+
+    print(f"[RF] Entrenando Random Forest Classifier con {len(df_train_clean):,} registros...")
+    modelo_rf = RandomForestClassifier(n_estimators=100, max_depth=6, min_samples_leaf=50, random_state=42)
+    modelo_rf.fit(X_train, y_train)
+
+    # 3. CARGA DE METADATOS EXCLUSIVOS DE 'TEST'
+    print("\nAccediendo a la subcarpeta 'test' para validación ciega...")
+    df_truth_test = pd.read_csv(os.path.join(dir_raiz, "test", "truth_test.csv"), names=['enrollment_id', 'dropped_out'], header=None)
+
+    # 4. PROCESAMIENTO EN TIEMPO REAL DEL CLICKSTREAM (CHUNKS)
+    path_log_test = os.path.join(dir_raiz, "test", "log_test.csv")
+    timestamps_estudiantes = {}
+    chunk_size = 200000
+    limite_lineas = 1000000  
+    lineas_leidas = 0
+    
+    for chunk in pd.read_csv(path_log_test, chunksize=chunk_size):
+        chunk['time'] = pd.to_datetime(chunk['time']).dt.tz_localize(None)
+        for en_id, g_log in chunk.groupby('enrollment_id'):
+            if en_id not in timestamps_estudiantes:
+                timestamps_estudiantes[en_id] = []
+            timestamps_estudiantes[en_id].extend(g_log['time'].tolist())
+        lineas_leidas += chunk_size
+        if lineas_leidas >= limite_lineas: break
+
+    # 5. EXTRACCIÓN CINÉTICA
+    datos_test = []
+    for en_id, lista_tiempos in timestamps_estudiantes.items():
+        if len(lista_tiempos) < 2: continue
+        lista_tiempos = sorted(lista_tiempos)
+        primer_clic = lista_tiempos[0]
+        dias_relativos = [(t - primer_clic).days for t in lista_tiempos]
+        dias_validos = [d for d in dias_relativos if 0 <= d <= 30]
+        if len(dias_validos) < 2: continue
+            
+        semanas = [(d // 7) + 1 for d in dias_validos]
+        df_sem = pd.Series(semanas).value_counts().reset_index()
+        df_sem.columns = ['semana', 'clics']
+        
+        slope, intercept = 0.0, float(df_sem['clics'].iloc[0])
+        mean_c = df_sem['clics'].mean()
+        cv = df_sem['clics'].std() / mean_c if (len(df_sem) > 1 and mean_c > 0) else 0.0
+        if len(df_sem) >= 2:
+            slope, intercept, _, _, _ = stats.linregress(df_sem['semana'].values, df_sem['clics'].values)
+            
+        vec_diario = np.zeros(31)
+        for d in dias_validos: vec_diario[d] = 1
+                
+        rachas, r_act = [], 0
+        for f in vec_diario:
+            if f == 0: r_act += 1
+            else:
+                if r_act > 0: rachas.append(r_act)
+                r_act = 0
+        if r_act > 0: rachas.append(r_act)
+        
+        datos_test.append({
+            'enrollment_id': int(en_id), 'beta_0_intercepto': float(intercept), 'beta_1_pendiente': float(slope),
+            'densidad_conexion': float((vec_diario.sum() / 31) * 100), 'coef_variacion': float(cv),
+            'max_racha_inactividad': float(max(rachas) if len(rachas) > 0 else 0)
+        })
+
+    df_eval_final = pd.DataFrame(datos_test).merge(df_truth_test, on='enrollment_id', how='inner')
+
+    # 6. INFERENCIA PREDICTIVA
+    X_test = df_eval_final[features_cols]
+    y_real = df_eval_final['dropped_out'].values
+    
+    df_eval_final['prediccion_sat'] = modelo_rf.predict(X_test)
+    df_eval_final['score_riesgo'] = modelo_rf.predict_proba(X_test)[:, 1]
+
+    # 7. REPORTE
+    acc = accuracy_score(y_real, df_eval_final['prediccion_sat'])
+    prec = precision_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
+    rec = recall_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
+    f1 = f1_score(y_real, df_eval_final['prediccion_sat'], zero_division=0)
+    auc_value = roc_auc_score(y_real, df_eval_final['score_riesgo'])
+    cm = confusion_matrix(y_real, df_eval_final['prediccion_sat'])
+
+    print("\n" + "="*80)
+    print("REPORTE DE RENDIMIENTO - RANDOM FOREST NATIVO")
+    print("="*80)
+    print(f"Accuracy: {acc*100:.2f}% | Precision: {prec*100:.2f}% | Recall: {rec*100:.2f}% | F1: {f1*100:.2f}% | AUC: {auc_value:.4f}")
+    print("="*80)
+    
+    # 8. EXPORTACIÓN A TABLA EXCLUSIVA
+    tabla_rf = 'tablon_predicciones_test_xuetangx_rf'
+    print(f"\nExportando a MySQL tabla: '{tabla_rf}'...")
+    df_eval_final.to_sql(name=tabla_rf, con=engine, if_exists='replace', index=False)
+
+    # 9. GENERACIÓN DE GRÁFICOS AISLADOS
+    timestamp = datetime.now().strftime("%Y%m%dd_%H%M%S")
+    
+    # Gráfico 1: Matriz de Confusión Corregida
+    print("Generando Matriz de Confusión...")
+    plt.clf()
+    fig1 = plt.figure(figsize=(7, 5), dpi=300)
+    sns.set_theme(style="white")
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Greens", cbar=False,
+                xticklabels=['Estable (0)', 'Alerta/Deserción (1)'],
+                yticklabels=['Realidad: Estable (0)', 'Realidad: Alerta/Deserción (1)'],
+                annot_kws={"size": 14, "weight": "bold"})
+    plt.title("Matriz de Confusión Final - Random Forest\nCohorte XuetangX (Ventana 30 Días)", fontsize=12, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dir_graficos, f"matriz_confusion_rf_{timestamp}.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig1)
+
+    # Gráfico 2: Curva ROC Individual
+    print("Generando Curva AUC ROC...")
+    plt.clf()
+    fig2 = plt.figure(figsize=(7, 6), dpi=300)
+    sns.set_theme(style="whitegrid")
+    fpr, tpr, _ = roc_curve(y_real, df_eval_final['score_riesgo'])
+    plt.plot(fpr, tpr, color='forestgreen', lw=2.5, label=f'Random Forest (AUC = {auc_value:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=1.5, linestyle='--', label='Clasificador Aleatorio (AUC = 0.50)')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Tasa de Falsos Positivos (1 - Especificidad)')
+    plt.ylabel('Tasa de Verdaderos Positivos (Sensibilidad)')
+    plt.title('Curva ROC - Random Forest Nativo\nValidación del Modelo en XuetangX', fontsize=12, fontweight='bold', pad=15)
+    plt.legend(loc="lower right", frameon=True, shadow=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dir_graficos, f"curva_roc_rf_{timestamp}.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig2)
+    print("Gráficos guardados exitosamente en la carpeta 'Graficos'.\n")
+
+if __name__ == "__main__":
+    ejecutar_prediccion_rf()
