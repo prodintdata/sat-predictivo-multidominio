@@ -1,0 +1,2 @@
+Algoritmo,Entorno_Validacion,Verdaderos_Negativos_TN,Falsos_Positivos_FP,Falsos_Negativos_FN,Verdaderos_Positivos_TP,Precision_Manual,Recall_Manual,F1_Score_Manual_Basal,precision_macro,recall_macro,f1_macro,accuracy,roc_auc,mse,r2_score
+Regresión Logística Nativa,XuetangX Test,1941,529,565,2145,0.8022,0.7915,0.7968,0.7884,0.7887,0.7885,0.7888,0.8543,0.2112,0.1534
