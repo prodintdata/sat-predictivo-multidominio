@@ -1,0 +1,2 @@
+Algoritmo,Entorno_Validacion,Verdaderos_Negativos_TN,Falsos_Positivos_FP,Falsos_Negativos_FN,Verdaderos_Positivos_TP,Precision_Manual,Recall_Manual,F1_Score_Manual_Basal,precision_macro,recall_macro,f1_macro,accuracy,roc_auc,mse,r2_score
+Árbol de Decisión EDA 8,OULAD Test split (20%),2128,296,712,940,0.7605,0.569,0.651,0.7549,0.7234,0.7297,0.7527,0.8002,0.2473,-0.026
